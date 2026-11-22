@@ -1,0 +1,183 @@
+# Builds the Astro site from the private source repository and publishes it to
+# the Ceph bucket behind fileformat.guru.
+#
+# The site source lives in OpenizePtyLtd/fileformat.guru (private). This workflow
+# lives in the public -workflows repository so builds run on free runners, while
+# all credentials come from repository/organization secrets.
+#
+# It is triggered by:
+#   - repository_dispatch from the source repository (automatic on push)
+#   - workflow_dispatch (manual run from the Actions tab)
+
+name: fileformat.guru (Prod)
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [deploy-fileformat-guru]
+
+# Never run two production deploys at once.
+concurrency:
+  group: fileformat-guru-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SITE_URL: https://fileformat.guru
+  BUCKET: fileformat.guru
+  S3_ENDPOINT: https://s3.dynabic.com
+  NODE_VERSION: '22'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      # The source repository is private, so checkout needs a token that can
+      # read it. A repository_dispatch run deploys the exact commit it was told
+      # to; a manual run leaves `ref` empty, which checks out that repository's
+      # default branch (master). Using github.ref_name here would be wrong on
+      # manual runs, because it names this workflows repository's branch.
+      - name: Checkout site source
+        uses: actions/checkout@v4
+        with:
+          repository: OpenizePtyLtd/fileformat.guru
+          token: ${{ secrets.REPO_TOKEN }}
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || '' }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Type-checks Astro/TS sources as part of the build gate.
+      - name: Type check
+        run: pnpm check
+
+      - name: Build site
+        env:
+          # The build fetches the latest GitHub release to resolve download
+          # links. Without a token it still works but can be rate-limited from
+          # shared runner IPs, in which case it silently falls back to the
+          # committed snapshot and would publish stale version numbers.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm build
+
+      # Provenance marker, matching the convention used by the other sites.
+      # Read the commit from the checkout rather than github.sha, because on
+      # manual runs github.sha identifies the workflows repository, not the
+      # site source that was actually built.
+      - name: Generate build info
+        env:
+          DISPATCH_REF: ${{ github.event.client_payload.ref }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          # A dispatched run checks out a specific SHA, which detaches HEAD, so
+          # prefer the branch name carried in the dispatch payload.
+          branch="${DISPATCH_REF}"
+          if [ -z "$branch" ]; then
+            branch=$(git rev-parse --abbrev-ref HEAD)
+          fi
+          printf 'Site: %s\nBranch: %s\nCommit: %s\nAuthor: %s\nDatetime: %s\n' \
+            "$SITE_URL" \
+            "$branch" \
+            "$commit" \
+            "$GITHUB_ACTOR" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > dist/build-info.txt
+          cat dist/build-info.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-dist
+          path: dist/
+          retention-days: 5
+
+  deploy:
+    name: Deploy to Ceph
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: site-dist
+          path: dist/
+
+      - name: Deploy to Ceph bucket
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CEPH_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CEPH_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          # Newer AWS CLI releases default to CRC64NVME checksums, which Ceph
+          # RGW rejects. Restricting checksum negotiation keeps sync working.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          set -euo pipefail
+
+          # Order matters. HTML is synced first and assets last, so that even if
+          # the asset exclude below were ever misapplied, the stylesheets still
+          # land after the pages that reference them. The reverse order could
+          # leave a deployed site with HTML but no CSS.
+
+          # 1. Pages, icons and generated files. --delete removes pages that no
+          #    longer exist (renamed routes, dropped locales). _astro is excluded
+          #    because step 2 owns it; AWS CLI does not delete objects matched by
+          #    an exclude filter, so those files survive this pass.
+          aws s3 sync dist/ "s3://${BUCKET}/" \
+            --delete \
+            --endpoint-url "${S3_ENDPOINT}" \
+            --exclude "_astro/*" \
+            --cache-control "public, max-age=0, must-revalidate"
+
+          # 2. Content-hashed assets. Filenames change when content changes, so
+          #    they can be cached forever and stale ones pruned safely.
+          aws s3 sync dist/_astro/ "s3://${BUCKET}/_astro/" \
+            --delete \
+            --endpoint-url "${S3_ENDPOINT}" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Verify bucket serves the site
+        run: |
+          set -euo pipefail
+          url="http://${BUCKET}.s3-website.dynabic.com/"
+          # Retry briefly: object writes are usually visible immediately, but a
+          # transient 5xx should not fail an otherwise successful deploy.
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)
+            echo "Attempt ${attempt}: HTTP ${code}"
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            sleep $((attempt * 3))
+          done
+          echo "Bucket did not return HTTP 200 for $url" >&2
+          exit 1
+
+  purge:
+    name: Purge Bunny CDN
+    needs: deploy
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Purge fileformat.guru
+        env:
+          BUNNYNET_ACCESSKEY: ${{ secrets.BUNNYNET_ACCESSKEY }}
+        run: |
+          set -euo pipefail
+          echo "Purging https://fileformat.guru"
+          curl -siG \
+            -H "X-Api-Key: ${BUNNYNET_ACCESSKEY}" \
+            --data-urlencode "url=https://fileformat.guru/*" \
+            "https://api.dynabic.com/bn/purge?async=true"
